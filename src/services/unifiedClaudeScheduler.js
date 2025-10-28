@@ -527,19 +527,9 @@ class UnifiedClaudeScheduler {
     logger.info(`📋 Found ${consoleAccounts.length} total Claude Console accounts`)
 
     for (const account of consoleAccounts) {
-      // 主动检查封禁状态并尝试恢复（在过滤之前执行，确保可以恢复被封禁的账户）
-      const wasBlocked = await claudeConsoleAccountService.isAccountBlocked(account.id)
-
-      // 如果账户之前被封禁但现在已恢复，重新获取最新状态
+      // 旧版封禁恢复逻辑已移除：现使用基于Redis TTL的故障转移机制，
+      // 由rateLimitCleanupService每5分钟自动检查并恢复temp_error账户
       let currentAccount = account
-      if (wasBlocked === false && account.status === 'account_blocked') {
-        // 可能刚刚被恢复，重新获取账户状态
-        const freshAccount = await claudeConsoleAccountService.getAccount(account.id)
-        if (freshAccount) {
-          currentAccount = freshAccount
-          logger.info(`🔄 Account ${account.name} was recovered from blocked status`)
-        }
-      }
 
       logger.info(
         `🔍 Checking Claude Console account: ${currentAccount.name} - isActive: ${currentAccount.isActive}, status: ${currentAccount.status}, accountType: ${currentAccount.accountType}, schedulable: ${currentAccount.schedulable}`

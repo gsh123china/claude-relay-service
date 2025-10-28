@@ -574,6 +574,7 @@ class Application {
       `🔄 OpenAI cleanup service started (checking every ${openaiCleanupIntervalSeconds} seconds)`
     )
 
+
     // 🔢 启动并发计数自动清理任务（Phase 1 修复：解决并发泄漏问题）
     // 每分钟主动清理所有过期的并发项，不依赖请求触发
     setInterval(async () => {

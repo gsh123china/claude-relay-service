@@ -84,6 +84,22 @@ class RateLimitCleanupService {
       // 清理 Claude Console 账号
       await this.cleanupClaudeConsoleAccounts(results.claudeConsole)
 
+      // 👇 新增：检查并恢复 Claude Console 的临时错误（temp_error）账户（TTL 精确恢复）
+      try {
+        const tempErrResult = await claudeConsoleAccountService.checkAndRecoverTempErrorAccounts()
+        if ((tempErrResult?.recovered || 0) > 0) {
+          logger.info(
+            `✅ Claude Console temp_error recovery: ${tempErrResult.recovered}/${tempErrResult.checked} accounts recovered by TTL`
+          )
+        } else if ((tempErrResult?.checked || 0) > 0) {
+          logger.debug(
+            `🔍 Claude Console temp_error check completed: ${tempErrResult.checked} accounts checked, none needed recovery`
+          )
+        }
+      } catch (ccTempErr) {
+        logger.error('❌ Failed to check/recover Claude Console temp_error accounts:', ccTempErr)
+      }
+
       const totalChecked =
         results.openai.checked + results.claude.checked + results.claudeConsole.checked
       const totalCleared =

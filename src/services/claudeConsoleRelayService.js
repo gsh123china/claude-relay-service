@@ -2,11 +2,15 @@ const axios = require('axios')
 const claudeConsoleAccountService = require('./claudeConsoleAccountService')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
-const {
-  sanitizeUpstreamError,
-  sanitizeErrorMessage,
-  isAccountDisabledError
-} = require('../utils/errorSanitizer')
+const { sanitizeUpstreamError, sanitizeErrorMessage } = require('../utils/errorSanitizer')
+const sessionHelper = require('../utils/sessionHelper')
+
+// 状态码常量（避免Magic Number）
+const STATUS_SUCCESS_MIN = 200
+const STATUS_SUCCESS_MAX = 299
+const STATUS_NOT_MODIFIED = 304
+const STATUS_TEMP_REDIRECT = 307
+const STATUS_NETWORK_ERROR = 0
 
 class ClaudeConsoleRelayService {
   constructor() {
@@ -210,41 +214,48 @@ class ClaudeConsoleRelayService {
         )
       }
 
-      // 检查是否为账户禁用/不可用的 400 错误
-      const accountDisabledError = isAccountDisabledError(response.status, response.data)
-
-      // 检查错误状态并相应处理
-      if (response.status === 401) {
+      if (
+        (response.status >= STATUS_SUCCESS_MIN && response.status <= STATUS_SUCCESS_MAX) ||
+        response.status === STATUS_NOT_MODIFIED ||
+        response.status === STATUS_TEMP_REDIRECT
+      ) {
+        try {
+          await claudeConsoleAccountService.clearRequestErrors(accountId)
+          const isRateLimited = await claudeConsoleAccountService.isAccountRateLimited(accountId)
+          if (isRateLimited) await claudeConsoleAccountService.removeAccountRateLimit(accountId)
+          const isOverloaded = await claudeConsoleAccountService.isAccountOverloaded(accountId)
+          if (isOverloaded) await claudeConsoleAccountService.removeAccountOverload(accountId)
+        } catch (e) {
+          logger.debug('Failed to clear counters or states after success:', e.message)
+        }
+      } else if (response.status === 401) {
         logger.warn(`🚫 Unauthorized error detected for Claude Console account ${accountId}`)
         await claudeConsoleAccountService.markAccountUnauthorized(accountId)
-      } else if (accountDisabledError) {
-        logger.error(
-          `🚫 Account disabled error (400) detected for Claude Console account ${accountId}, marking as blocked`
-        )
-        // 传入完整的错误详情到 webhook
-        const errorDetails =
-          typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
-        await claudeConsoleAccountService.markConsoleAccountBlocked(accountId, errorDetails)
       } else if (response.status === 429) {
         logger.warn(`🚫 Rate limit detected for Claude Console account ${accountId}`)
-        // 收到429先检查是否因为超过了手动配置的每日额度
         await claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
           logger.error('❌ Failed to check quota after 429 error:', err)
         })
-
         await claudeConsoleAccountService.markAccountRateLimited(accountId)
-      } else if (response.status === 529) {
-        logger.warn(`🚫 Overload error detected for Claude Console account ${accountId}`)
-        await claudeConsoleAccountService.markAccountOverloaded(accountId)
-      } else if (response.status === 200 || response.status === 201) {
-        // 如果请求成功，检查并移除错误状态
-        const isRateLimited = await claudeConsoleAccountService.isAccountRateLimited(accountId)
-        if (isRateLimited) {
-          await claudeConsoleAccountService.removeAccountRateLimit(accountId)
+      } else {
+        if (response.status === 529) {
+          logger.warn(`🚫 Overload error detected for Claude Console account ${accountId}`)
+          await claudeConsoleAccountService.markAccountOverloaded(accountId)
         }
-        const isOverloaded = await claudeConsoleAccountService.isAccountOverloaded(accountId)
-        if (isOverloaded) {
-          await claudeConsoleAccountService.removeAccountOverload(accountId)
+        if (claudeConsoleAccountService.shouldCountAsFailure(response.status)) {
+          const count = await claudeConsoleAccountService.recordRequestError(
+            accountId,
+            response.status
+          )
+          const { threshold } = claudeConsoleAccountService._getFailoverConfig()
+          if (count >= threshold) {
+            const sessionHash = sessionHelper.generateSessionHash(modifiedRequestBody)
+            await claudeConsoleAccountService.markAccountTempError(
+              accountId,
+              sessionHash,
+              `status=${response.status}`
+            )
+          }
         }
       }
 
@@ -293,6 +304,25 @@ class ClaudeConsoleRelayService {
         `❌ Claude Console relay request failed (Account: ${account?.name || accountId}):`,
         error.message
       )
+
+      // 网络类错误（无 HTTP 状态码）计入失败，并检查阈值
+      try {
+        const count = await claudeConsoleAccountService.recordRequestError(
+          accountId,
+          STATUS_NETWORK_ERROR
+        )
+        const { threshold } = claudeConsoleAccountService._getFailoverConfig()
+        if (count >= threshold) {
+          const sessionHash = sessionHelper.generateSessionHash(requestBody || {})
+          await claudeConsoleAccountService.markAccountTempError(
+            accountId,
+            sessionHash,
+            'network_error'
+          )
+        }
+      } catch (e) {
+        logger.debug('Failed to record network error for failover:', e.message)
+      }
 
       // 不再因为模型不支持而block账号
 
@@ -372,6 +402,24 @@ class ClaudeConsoleRelayService {
         `❌ Claude Console stream relay failed (Account: ${account?.name || accountId}):`,
         error
       )
+      // 计入网络类失败并检查阈值
+      try {
+        const count = await claudeConsoleAccountService.recordRequestError(
+          accountId,
+          STATUS_NETWORK_ERROR
+        )
+        const { threshold } = claudeConsoleAccountService._getFailoverConfig()
+        if (count >= threshold) {
+          const sessionHash = sessionHelper.generateSessionHash(body || {})
+          await claudeConsoleAccountService.markAccountTempError(
+            accountId,
+            sessionHash,
+            'network_error'
+          )
+        }
+      } catch (e) {
+        logger.debug('Failed to record stream network error for failover:', e.message)
+      }
       throw error
     }
   }
@@ -465,40 +513,53 @@ class ClaudeConsoleRelayService {
 
             response.data.on('data', (chunk) => {
               errorChunks.push(chunk)
-              errorDataForCheck += chunk.toString()
+              try {
+                errorDataForCheck += chunk.toString()
+              } catch (e) {
+                logger.debug('Failed to convert chunk to string:', e.message)
+              }
             })
 
             response.data.on('end', async () => {
               // 记录原始错误消息到日志（方便调试，包含供应商信息）
-              logger.error(
-                `📝 [Stream] Upstream error response from ${account?.name || accountId}: ${errorDataForCheck.substring(0, 500)}`
-              )
+              try {
+                logger.error(
+                  `📝 [Stream] Upstream error response from ${account?.name || accountId}: ${errorDataForCheck.substring(0, 500)}`
+                )
+              } catch (e) {
+                logger.error(
+                  `📝 [Stream] Upstream error response from ${account?.name || accountId}: [Failed to format error data: ${e.message}]`
+                )
+              }
 
-              // 检查是否为账户禁用错误
-              const accountDisabledError = isAccountDisabledError(
-                response.status,
-                errorDataForCheck
-              )
+              const sessionHash = sessionHelper.generateSessionHash(body || {})
 
               if (response.status === 401) {
                 await claudeConsoleAccountService.markAccountUnauthorized(accountId)
-              } else if (accountDisabledError) {
-                logger.error(
-                  `🚫 [Stream] Account disabled error (400) detected for Claude Console account ${accountId}, marking as blocked`
-                )
-                // 传入完整的错误详情到 webhook
-                await claudeConsoleAccountService.markConsoleAccountBlocked(
-                  accountId,
-                  errorDataForCheck
-                )
               } else if (response.status === 429) {
                 await claudeConsoleAccountService.markAccountRateLimited(accountId)
                 // 检查是否因为超过每日额度
                 claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
                   logger.error('❌ Failed to check quota after 429 error:', err)
                 })
-              } else if (response.status === 529) {
-                await claudeConsoleAccountService.markAccountOverloaded(accountId)
+              } else {
+                if (response.status === 529) {
+                  await claudeConsoleAccountService.markAccountOverloaded(accountId)
+                }
+                if (claudeConsoleAccountService.shouldCountAsFailure(response.status)) {
+                  const count = await claudeConsoleAccountService.recordRequestError(
+                    accountId,
+                    response.status
+                  )
+                  const { threshold } = claudeConsoleAccountService._getFailoverConfig()
+                  if (count >= threshold) {
+                    await claudeConsoleAccountService.markAccountTempError(
+                      accountId,
+                      sessionHash,
+                      `status=${response.status}`
+                    )
+                  }
+                }
               }
 
               // 设置响应头

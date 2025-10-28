@@ -51,10 +51,10 @@
 
 ### 适合的场景
 
-✅ **找朋友拼车**: 三五好友一起分摊Claude Code Max订阅  
-✅ **隐私敏感**: 不想让第三方镜像看到你的对话内容  
-✅ **技术折腾**: 有基本的技术基础，愿意自己搭建和维护  
-✅ **稳定需求**: 需要长期稳定的Claude访问，不想受制于镜像站  
+✅ **找朋友拼车**: 三五好友一起分摊Claude Code Max订阅
+✅ **隐私敏感**: 不想让第三方镜像看到你的对话内容
+✅ **技术折腾**: 有基本的技术基础，愿意自己搭建和维护
+✅ **稳定需求**: 需要长期稳定的Claude访问，不想受制于镜像站
 ✅ **地区受限**: 无法直接访问Claude官方服务
 
 ---
@@ -91,6 +91,8 @@
 - 📊 **监控面板**: Web界面查看所有数据
 - 🛡️ **安全控制**: 访问限制、速率控制、客户端限制
 - 🌐 **代理支持**: 支持HTTP/SOCKS5代理
+
+- 🧯 **Claude Console 故障转移**: 错误计数 → 阈值触发 → 临时禁用（Redis TTL） → 自动恢复（集成 rateLimitCleanupService 每 5 分钟）
 
 ---
 
@@ -317,6 +319,18 @@ docker-compose.yml 已包含：
 
 - `ADMIN_USERNAME`: 管理员用户名（不设置则自动生成）
 - `ADMIN_PASSWORD`: 管理员密码（不设置则自动生成）
+
+#### Claude Console 故障转移配置（可选）
+
+```bash
+# 触发临时禁用的失败次数阈值（默认10次）
+CLAUDE_CONSOLE_ERROR_THRESHOLD=10
+# 错误计数时间窗口（分钟，默认5）
+CLAUDE_CONSOLE_ERROR_WINDOW_MINUTES=5
+# 临时禁用持续时长（分钟，默认10）
+CLAUDE_CONSOLE_TEMP_DISABLE_MINUTES=10
+```
+
 - `LOG_LEVEL`: 日志级别（默认：info）
 - 更多配置项请参考 `.env.example` 文件
 
@@ -450,7 +464,7 @@ env_key = "CRS_OAI_KEY"
 
 ```json
 {
-    "OPENAI_API_KEY": null  
+    "OPENAI_API_KEY": null
 }
 ```
 
@@ -562,7 +576,7 @@ gpt-5                      # Codex使用固定模型ID
 - 根据不同的路由前缀自动识别账号类型
 - `/claude/` - 使用Claude账号池
 - `/droid/claude/` - 使用Droid类型Claude账号池（只建议api调用或Droid Cli中使用）
-- `/gemini/` - 使用Gemini账号池  
+- `/gemini/` - 使用Gemini账号池
 - `/openai/` - 使用Codex账号（只支持Openai-Response格式）
 - `/droid/openai/` - 使用Droid类型OpenAI兼容账号池（只建议api调用或Droid Cli中使用）
 - 支持所有标准API端点（messages、models等）

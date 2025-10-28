@@ -16,6 +16,22 @@ class ClaudeConsoleAccountService {
     this.ACCOUNT_KEY_PREFIX = 'claude_console_account:'
     this.SHARED_ACCOUNTS_KEY = 'shared_claude_console_accounts'
 
+    this.REQUEST_ERROR_KEY_PREFIX = 'claude_console_account:request_errors:'
+    this.TEMP_ERROR_KEY_PREFIX = 'claude_console_account:temp_error:'
+    this.TEMP_ERROR_LOCK_PREFIX = 'claude_console_account:temp_error:lock:'
+
+    this.STATUS_SUCCESS_MIN = 200
+    this.STATUS_SUCCESS_MAX = 299
+    this.STATUS_NOT_MODIFIED = 304
+    this.STATUS_TEMP_REDIRECT = 307
+    this.STATUS_NETWORK_ERROR = 0
+
+    this.DEFAULT_FAILOVER = {
+      threshold: 10,
+      windowMinutes: 5,
+      tempDisableMinutes: 10
+    }
+
     // 🚀 性能优化：缓存派生的加密密钥，避免每次重复计算
     // scryptSync 是 CPU 密集型操作，缓存可以减少 95%+ 的 CPU 密集型操作
     this._encryptionKeyCache = null
@@ -36,18 +52,281 @@ class ClaudeConsoleAccountService {
     )
   }
 
-  _getBlockedHandlingMinutes() {
-    const raw = process.env.CLAUDE_CONSOLE_BLOCKED_HANDLING_MINUTES
-    if (raw === undefined || raw === null || raw === '') {
+  /**
+   * 获取Claude Console故障转移配置（与OpenAI结构对齐）
+   * - threshold: 连续失败次数阈值
+   * - windowMinutes: 错误计数时间窗口（分钟）
+   * - tempDisableMinutes: 临时禁用持续时长（分钟）
+   */
+  _getFailoverConfig() {
+    const cfg = config?.claudeConsole?.failover || {}
+    const t = parseInt(cfg.threshold)
+    const w = parseInt(cfg.windowMinutes)
+    const d = parseInt(cfg.tempDisableMinutes)
+    return {
+      threshold: Number.isFinite(t) && t > 0 ? t : this.DEFAULT_FAILOVER.threshold,
+      windowMinutes: Number.isFinite(w) && w > 0 ? w : this.DEFAULT_FAILOVER.windowMinutes,
+      tempDisableMinutes: Number.isFinite(d) && d > 0 ? d : this.DEFAULT_FAILOVER.tempDisableMinutes
+    }
+  }
+
+  /**
+   * 是否计为失败：
+   * 成功：2xx、304、307
+   * 特例（不计入失败）：401/402/429
+   * 其他：均计为失败
+   */
+  shouldCountAsFailure(statusCode) {
+    if (
+      (statusCode >= this.STATUS_SUCCESS_MIN && statusCode <= this.STATUS_SUCCESS_MAX) ||
+      statusCode === this.STATUS_NOT_MODIFIED ||
+      statusCode === this.STATUS_TEMP_REDIRECT
+    ) {
+      return false
+    }
+    if (statusCode === 401 || statusCode === 402 || statusCode === 429) {
+      return false
+    }
+    return true
+  }
+
+  /**
+   * 记录一次请求失败，并返回当前窗口内累计失败次数
+   */
+  async recordRequestError(accountId, statusCode) {
+    try {
+      const client = redis.getClientSafe()
+      const key = `${this.REQUEST_ERROR_KEY_PREFIX}${accountId}`
+      const { windowMinutes } = this._getFailoverConfig()
+      const ttl = Math.max(1, windowMinutes * 60)
+      const pipeline = client.pipeline()
+      pipeline.incr(key)
+      pipeline.expire(key, ttl)
+      const results = await pipeline.exec()
+      const count = Array.isArray(results) && results[0] ? results[0][1] : 0
+      logger.warn(
+        `📉 Claude-Console failure recorded: accountId=${accountId}, status=${statusCode}, window=${windowMinutes}min, count=${count}`
+      )
+      return count
+    } catch (error) {
+      logger.error(`❌ Failed to record Claude-Console error (accountId=${accountId}):`, error)
       return 0
     }
+  }
 
-    const parsed = Number.parseInt(raw, 10)
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+  /** 获取当前窗口内失败次数 */
+  async getRequestErrorCount(accountId) {
+    try {
+      const client = redis.getClientSafe()
+      const key = `${this.REQUEST_ERROR_KEY_PREFIX}${accountId}`
+      const val = await client.get(key)
+      const count = parseInt(val || '0', 10)
+      return Number.isFinite(count) ? count : 0
+    } catch (error) {
+      logger.error(`❌ Failed to get Claude-Console error count (accountId=${accountId}):`, error)
       return 0
     }
+  }
 
-    return parsed
+  /** 清除失败计数 */
+  async clearRequestErrors(accountId) {
+    try {
+      const client = redis.getClientSafe()
+      const key = `${this.REQUEST_ERROR_KEY_PREFIX}${accountId}`
+      await client.del(key)
+      logger.info(`🧹 Cleared Claude-Console error counter: accountId=${accountId}`)
+    } catch (error) {
+      logger.error(
+        `❌ Failed to clear Claude-Console error counter (accountId=${accountId}):`,
+        error
+      )
+    }
+  }
+
+  /**
+   * 将账户标记为临时错误（temp_error），并设置TTL以便自动恢复
+   */
+  async markAccountTempError(accountId, sessionHash = null, reason = '') {
+    const account = await this.getAccount(accountId)
+    if (!account) {
+      throw new Error('Account not found')
+    }
+
+    const client = redis.getClientSafe()
+    const tempErrorKey = `${this.TEMP_ERROR_KEY_PREFIX}${accountId}`
+    const lockKey = `${this.TEMP_ERROR_LOCK_PREFIX}${accountId}`
+    const { tempDisableMinutes } = this._getFailoverConfig()
+
+    // 分布式锁，30s 兜底
+    const locked = await client.set(lockKey, '1', 'NX', 'EX', 30)
+    if (!locked) {
+      logger.debug(`🔒 Claude-Console account ${accountId} already being marked temp_error`)
+      return { success: false, reason: 'already_processing' }
+    }
+
+    try {
+      // 若已是 temp_error 则跳过
+      if (account.status === 'temp_error') {
+        return { success: false, reason: 'already_temp_error' }
+      }
+
+      const now = new Date().toISOString()
+      await this.updateAccount(accountId, {
+        status: 'temp_error',
+        schedulable: 'false',
+        errorMessage: reason || 'Temporarily disabled due to multiple failures within time window',
+        tempErrorAt: now
+      })
+
+      await client.setex(
+        tempErrorKey,
+        tempDisableMinutes * 60,
+        JSON.stringify({
+          accountId,
+          accountName: account.name,
+          disabledAt: now,
+          willRecoverAt: new Date(Date.now() + tempDisableMinutes * 60000).toISOString()
+        })
+      )
+
+      // 通知 webhook
+      try {
+        const webhookNotifier = require('../utils/webhookNotifier')
+        await webhookNotifier.sendAccountAnomalyNotification({
+          accountId,
+          accountName: account.name || accountId,
+          platform: 'claude-console',
+          status: 'temp_error',
+          errorCode: 'CLAUDE_CONSOLE_TEMP_ERROR',
+          reason: reason || 'Multiple failures within window; temporarily disabled',
+          timestamp: now
+        })
+      } catch (e) {
+        logger.error('Failed to send temp_error webhook (claude-console):', e)
+      }
+
+      logger.warn(
+        `⚠️ Claude-Console account temporarily disabled: ${account.name || accountId}, will recover in ${tempDisableMinutes} minutes`
+      )
+      return { success: true }
+    } finally {
+      await client.del(lockKey)
+    }
+  }
+
+  /**
+   * 定期检测并恢复已过TTL的临时错误账户（两遍扫描避免漏恢复）
+   */
+  async checkAndRecoverTempErrorAccounts() {
+    try {
+      const client = redis.getClientSafe()
+      const pattern = `${this.TEMP_ERROR_KEY_PREFIX}*`
+      let cursor = '0'
+      let recovered = 0
+      let checked = 0
+
+      // 第一遍：扫描 temp_error:* 键
+      do {
+        const [next, keys] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 200)
+        cursor = next
+        for (const key of keys) {
+          checked++
+          const accountId = key.split(':').pop()
+          const exists = await client.exists(key)
+          if (!exists) {
+            const account = await this.getAccount(accountId)
+            if (account && account.status === 'temp_error') {
+              await this.updateAccount(accountId, {
+                status: 'active',
+                schedulable: 'true',
+                errorMessage: '',
+                tempErrorAt: ''
+              })
+              await this.clearRequestErrors(accountId)
+              try {
+                const webhookNotifier = require('../utils/webhookNotifier')
+                await webhookNotifier.sendAccountAnomalyNotification({
+                  accountId,
+                  accountName: account.name || accountId,
+                  platform: 'claude-console',
+                  status: 'recovered',
+                  errorCode: 'CLAUDE_CONSOLE_TEMP_ERROR_RECOVERED',
+                  reason: 'Auto-recovered after temporary disable period',
+                  timestamp: new Date().toISOString()
+                })
+              } catch (e) {
+                logger.error('Failed to send recovery webhook (claude-console):', e)
+              }
+              recovered++
+            }
+          }
+        }
+      } while (cursor !== '0')
+
+      // 第二遍兜底：扫描所有账户哈希，若 status=temp_error 但无 temp_error key，则立即恢复
+      cursor = '0'
+      do {
+        const [next2, keys2] = await client.scan(
+          cursor,
+          'MATCH',
+          `${this.ACCOUNT_KEY_PREFIX}*`,
+          'COUNT',
+          200
+        )
+        cursor = next2
+        for (const key of keys2) {
+          const suffix = key.substring(this.ACCOUNT_KEY_PREFIX.length)
+          if (
+            suffix.startsWith('request_errors:') ||
+            suffix.startsWith('temp_error:') ||
+            suffix.startsWith('temp_error:lock:')
+          ) {
+            continue
+          }
+          let status
+          try {
+            status = await client.hget(key, 'status')
+          } catch (_) {
+            continue
+          }
+          if (status === 'temp_error') {
+            const accountId = key.replace(this.ACCOUNT_KEY_PREFIX, '')
+            const tempKey = `${this.TEMP_ERROR_KEY_PREFIX}${accountId}`
+            const exists = await client.exists(tempKey)
+            if (!exists) {
+              const account = await this.getAccount(accountId)
+              await this.updateAccount(accountId, {
+                status: 'active',
+                schedulable: 'true',
+                errorMessage: '',
+                tempErrorAt: ''
+              })
+              await this.clearRequestErrors(accountId)
+              try {
+                const webhookNotifier = require('../utils/webhookNotifier')
+                await webhookNotifier.sendAccountAnomalyNotification({
+                  accountId,
+                  accountName: account?.name || accountId,
+                  platform: 'claude-console',
+                  status: 'recovered',
+                  errorCode: 'CLAUDE_CONSOLE_TEMP_ERROR_RECOVERED',
+                  reason: 'Auto-recovered after temporary disable period',
+                  timestamp: new Date().toISOString()
+                })
+              } catch (e) {
+                logger.error('Failed to send recovery webhook (claude-console):', e)
+              }
+              recovered++
+            }
+          }
+        }
+      } while (cursor !== '0')
+
+      return { checked, recovered }
+    } catch (error) {
+      logger.error('❌ Failed to check/recover Claude-Console temp error accounts:', error)
+      return { checked: 0, recovered: 0 }
+    }
   }
 
   // 🏢 创建Claude Console账户
@@ -161,6 +440,16 @@ class ClaudeConsoleAccountService {
       const accounts = []
 
       for (const key of keys) {
+        // 🔍 过滤非 Hash 类型的键（request_errors、temp_error 等是 String 类型）
+        const suffix = key.substring(this.ACCOUNT_KEY_PREFIX.length)
+        if (
+          suffix.startsWith('request_errors:') ||
+          suffix.startsWith('temp_error:') ||
+          suffix.startsWith('temp_error:lock:')
+        ) {
+          continue // 跳过非账户数据的辅助键
+        }
+
         const accountData = await client.hgetall(key)
         if (accountData && Object.keys(accountData).length > 0) {
           if (!accountData.id) {
@@ -328,6 +617,17 @@ class ClaudeConsoleAccountService {
         } else {
           logger.info(`⛔ Manually disabled scheduling for Claude Console account ${accountId}`)
         }
+      }
+
+      // 故障转移相关字段
+      if (updates.status !== undefined) {
+        updatedData.status = updates.status
+      }
+      if (updates.errorMessage !== undefined) {
+        updatedData.errorMessage = updates.errorMessage
+      }
+      if (updates.tempErrorAt !== undefined) {
+        updatedData.tempErrorAt = updates.tempErrorAt
       }
 
       // 额度管理相关字段
@@ -701,183 +1001,6 @@ class ClaudeConsoleAccountService {
     } catch (error) {
       logger.error(`❌ Failed to mark Claude Console account as unauthorized: ${accountId}`, error)
       throw error
-    }
-  }
-
-  // 🚫 标记账号为临时封禁状态（400错误 - 账户临时禁用）
-  async markConsoleAccountBlocked(accountId, errorDetails = '') {
-    try {
-      const client = redis.getClientSafe()
-      const account = await this.getAccount(accountId)
-
-      if (!account) {
-        throw new Error('Account not found')
-      }
-
-      const blockedMinutes = this._getBlockedHandlingMinutes()
-
-      if (blockedMinutes <= 0) {
-        logger.info(
-          `ℹ️ CLAUDE_CONSOLE_BLOCKED_HANDLING_MINUTES 未设置或为0，跳过账户封禁：${account.name} (${accountId})`
-        )
-
-        if (account.blockedStatus === 'blocked') {
-          try {
-            await this.removeAccountBlocked(accountId)
-          } catch (cleanupError) {
-            logger.warn(`⚠️ 尝试移除账户封禁状态失败：${accountId}`, cleanupError)
-          }
-        }
-
-        return { success: false, skipped: true }
-      }
-
-      const updates = {
-        blockedAt: new Date().toISOString(),
-        blockedStatus: 'blocked',
-        isActive: 'false', // 禁用账户（与429保持一致）
-        schedulable: 'false', // 停止调度（与429保持一致）
-        status: 'account_blocked', // 设置状态（与429保持一致）
-        errorMessage: '账户临时被禁用（400错误）',
-        // 使用独立的封禁自动停止标记
-        blockedAutoStopped: 'true'
-      }
-
-      await client.hset(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, updates)
-
-      // 发送Webhook通知，包含完整错误详情
-      try {
-        const webhookNotifier = require('../utils/webhookNotifier')
-        await webhookNotifier.sendAccountAnomalyNotification({
-          accountId,
-          accountName: account.name || 'Claude Console Account',
-          platform: 'claude-console',
-          status: 'error',
-          errorCode: 'CLAUDE_CONSOLE_BLOCKED',
-          reason: `账户临时被禁用（400错误）。账户将在 ${blockedMinutes} 分钟后自动恢复。`,
-          errorDetails: errorDetails || '无错误详情',
-          timestamp: new Date().toISOString()
-        })
-      } catch (webhookError) {
-        logger.error('Failed to send blocked webhook notification:', webhookError)
-      }
-
-      logger.warn(`🚫 Claude Console account temporarily blocked: ${account.name} (${accountId})`)
-      return { success: true }
-    } catch (error) {
-      logger.error(`❌ Failed to mark Claude Console account as blocked: ${accountId}`, error)
-      throw error
-    }
-  }
-
-  // ✅ 移除账号的临时封禁状态
-  async removeAccountBlocked(accountId) {
-    try {
-      const client = redis.getClientSafe()
-      const accountKey = `${this.ACCOUNT_KEY_PREFIX}${accountId}`
-
-      // 获取账户当前状态和额度信息
-      const [currentStatus, quotaStoppedAt] = await client.hmget(
-        accountKey,
-        'status',
-        'quotaStoppedAt'
-      )
-
-      // 删除封禁相关字段
-      await client.hdel(accountKey, 'blockedAt', 'blockedStatus')
-
-      // 根据不同情况决定是否恢复账户
-      if (currentStatus === 'account_blocked') {
-        if (quotaStoppedAt) {
-          // 还有额度限制，改为quota_exceeded状态
-          await client.hset(accountKey, {
-            status: 'quota_exceeded'
-            // isActive保持false
-          })
-          logger.info(
-            `⚠️ Blocked status removed but quota exceeded remains for account: ${accountId}`
-          )
-        } else {
-          // 没有额度限制，完全恢复
-          const accountData = await client.hgetall(accountKey)
-          const updateData = {
-            isActive: 'true',
-            status: 'active',
-            errorMessage: ''
-          }
-
-          const hadAutoStop = accountData.blockedAutoStopped === 'true'
-
-          // 只恢复因封禁而自动停止的账户
-          if (hadAutoStop && accountData.schedulable === 'false') {
-            updateData.schedulable = 'true' // 恢复调度
-            logger.info(
-              `✅ Auto-resuming scheduling for Claude Console account ${accountId} after blocked status cleared`
-            )
-          }
-
-          if (hadAutoStop) {
-            await client.hdel(accountKey, 'blockedAutoStopped')
-          }
-
-          await client.hset(accountKey, updateData)
-          logger.success(`✅ Blocked status removed and account re-enabled: ${accountId}`)
-        }
-      } else {
-        if (await client.hdel(accountKey, 'blockedAutoStopped')) {
-          logger.info(
-            `ℹ️ Removed stale auto-stop flag for Claude Console account ${accountId} during blocked status recovery`
-          )
-        }
-        logger.success(`✅ Blocked status removed for Claude Console account: ${accountId}`)
-      }
-
-      return { success: true }
-    } catch (error) {
-      logger.error(
-        `❌ Failed to remove blocked status for Claude Console account: ${accountId}`,
-        error
-      )
-      throw error
-    }
-  }
-
-  // 🔍 检查账号是否处于临时封禁状态
-  async isAccountBlocked(accountId) {
-    try {
-      const account = await this.getAccount(accountId)
-      if (!account) {
-        return false
-      }
-
-      if (account.blockedStatus === 'blocked' && account.blockedAt) {
-        const blockedDuration = this._getBlockedHandlingMinutes()
-
-        if (blockedDuration <= 0) {
-          await this.removeAccountBlocked(accountId)
-          return false
-        }
-
-        const blockedAt = new Date(account.blockedAt)
-        const now = new Date()
-        const minutesSinceBlocked = (now - blockedAt) / (1000 * 60)
-
-        // 禁用时长过后自动恢复
-        if (minutesSinceBlocked >= blockedDuration) {
-          await this.removeAccountBlocked(accountId)
-          return false
-        }
-
-        return true
-      }
-
-      return false
-    } catch (error) {
-      logger.error(
-        `❌ Failed to check blocked status for Claude Console account: ${accountId}`,
-        error
-      )
-      return false
     }
   }
 

@@ -93,7 +93,9 @@ class WebhookNotifier {
       'claude-console': {
         blocked: 'CLAUDE_CONSOLE_BLOCKED',
         error: 'CLAUDE_CONSOLE_ERROR',
-        disabled: 'CLAUDE_CONSOLE_MANUALLY_DISABLED'
+        disabled: 'CLAUDE_CONSOLE_MANUALLY_DISABLED',
+        temp_error: 'CLAUDE_CONSOLE_TEMP_ERROR',
+        recovered: 'CLAUDE_CONSOLE_TEMP_ERROR_RECOVERED'
       },
       gemini: {
         error: 'GEMINI_ERROR',

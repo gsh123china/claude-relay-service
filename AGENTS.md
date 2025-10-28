@@ -1,9 +1,3 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-这个文件为 Claude Code (claude.ai/code) 提供在此代码库中工作的指导。
-
 ## 项目概述
 
 Claude Relay Service 是一个多平台 AI API 中转服务，支持 **Claude (官方/Console)、Gemini、OpenAI Responses (Codex)、AWS Bedrock、Azure OpenAI、Droid (Factory.ai)、CCR** 等多种账户类型。提供完整的多账户管理、API Key 认证、代理配置、用户管理、LDAP认证、Webhook通知和现代化 Web 管理界面。该服务作为客户端（如 Claude Code、Gemini CLI、Codex、Droid CLI、Cherry Studio 等）与 AI API 之间的中间件，提供认证、限流、监控、定价计算、成本统计等功能。
@@ -319,7 +313,7 @@ npm run setup  # 自动生成密钥并创建管理员账户
 ### Claude Console 故障转移（Failover）
 
 - 统一判定：成功=2xx/304/307；失败=其余状态码（不计入失败：401/402/429）。529 单独标记为过载（overloaded）。
-- 错误计数：在时间窗口内累计失败次数，达阈值标记 `status=temp_error`、`schedulable=false`，并写入 Redis TTL；任一成功请求立即清零计数。
+- 错误计数：在时间窗口内累计失败次数，达到阈值标记 `status=temp_error`、`schedulable=false`，并写入 Redis TTL；任一成功请求立即清零计数。
 - 自动恢复：依赖 TTL 到期后由 `rateLimitCleanupService`（每5分钟）兜底检查并恢复为 `active`，同时发送 Webhook 通知（platform=`claude-console`）。
 - Redis 键：
   - 计数：`claude_console_account:request_errors:{id}`
