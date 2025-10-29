@@ -592,13 +592,26 @@ async function handleMessagesRequest(req, res) {
         bodyLength: response.body ? response.body.length : 0
       })
 
-      res.status(response.statusCode)
-
       // 设置响应头，避免 Content-Length 和 Transfer-Encoding 冲突
+      // 同时验证并清理 Content-Type 以防止格式异常导致崩溃
       const skipHeaders = ['content-encoding', 'transfer-encoding', 'content-length']
       Object.keys(response.headers).forEach((key) => {
         if (!skipHeaders.includes(key.toLowerCase())) {
-          res.setHeader(key, response.headers[key])
+          // 特殊处理 Content-Type，清理可能的格式问题
+          if (key.toLowerCase() === 'content-type') {
+            try {
+              // 移除末尾可能的多余分号和空格
+              let contentType = response.headers[key]
+              if (typeof contentType === 'string') {
+                contentType = contentType.trim().replace(/;+$/, '')
+                res.setHeader(key, contentType)
+              }
+            } catch (e) {
+              logger.warn(`⚠️ Skipping malformed Content-Type header: ${response.headers[key]}`)
+            }
+          } else {
+            res.setHeader(key, response.headers[key])
+          }
         }
       })
 
@@ -657,11 +670,77 @@ async function handleMessagesRequest(req, res) {
           logger.warn('⚠️ No usage data found in Claude API JSON response')
         }
 
-        res.json(jsonData)
+        // 安全地发送JSON响应
+        try {
+          res.status(response.statusCode).json(jsonData)
+        } catch (sendError) {
+          // 如果发送失败（可能因为响应头问题），清除并重试
+          logger.error(
+            '⚠️ Failed to send JSON response, retrying with clean headers:',
+            sendError.message
+          )
+          if (!res.headersSent) {
+            res.removeHeader('content-type')
+            res.status(response.statusCode).type('application/json').send(JSON.stringify(jsonData))
+          }
+        }
       } catch (parseError) {
         logger.warn('⚠️ Failed to parse Claude API response as JSON:', parseError.message)
-        logger.info('📄 Raw response body:', response.body)
-        res.send(response.body)
+        logger.info('📄 Raw response body:', response.body?.substring?.(0, 500) || response.body)
+
+        // 检测是否是被拦截的HTML响应（检查content-type和响应内容）
+        const contentType = response.headers?.['content-type'] || ''
+        const isHtmlResponse = contentType.includes('text/html')
+        const hasBlockHeader = response.headers?.['x-block'] !== undefined
+        const bodyPreview = (response.body || '').substring(0, 100).toLowerCase()
+        const looksLikeHtml =
+          bodyPreview.includes('<html') ||
+          bodyPreview.includes('<!doctype') ||
+          bodyPreview.includes('<body')
+
+        // 如果是HTML拦截页面或非JSON响应，返回标准JSON错误
+        if (isHtmlResponse || hasBlockHeader || looksLikeHtml) {
+          logger.error(
+            `🚫 Upstream returned non-JSON response (likely blocked/filtered). Content-Type: ${contentType}, x-block: ${response.headers?.['x-block']}`
+          )
+
+          // 返回标准的Claude API错误格式
+          const errorResponse = {
+            type: 'error',
+            error: {
+              type: 'api_error',
+              message:
+                'Upstream API returned an invalid response. The request may have been blocked by a security filter or the API key may be invalid.'
+            }
+          }
+
+          if (!res.headersSent) {
+            // 使用502状态码表示上游网关错误
+            res.status(502).json(errorResponse)
+          }
+        } else {
+          // 其他类型的解析错误，尝试返回原始响应
+          try {
+            if (!res.headersSent) {
+              res.removeHeader('content-type')
+              res
+                .status(response.statusCode)
+                .type('text/plain')
+                .send(response.body || 'Upstream returned invalid response')
+            }
+          } catch (sendError) {
+            logger.error('❌ Failed to send error response:', sendError.message)
+            if (!res.headersSent) {
+              res.status(500).json({
+                type: 'error',
+                error: {
+                  type: 'api_error',
+                  message: 'Failed to process upstream response'
+                }
+              })
+            }
+          }
+        }
       }
 
       // 如果没有记录usage，只记录警告，不进行估算

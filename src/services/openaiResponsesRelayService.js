@@ -148,7 +148,16 @@ class OpenAIResponsesRelayService {
             resets_in_seconds: resetsInSeconds
           }
         }
-        return res.status(429).json(errorResponse)
+
+        // 安全地返回错误响应
+        try {
+          return res.status(429).json(errorResponse)
+        } catch (sendError) {
+          logger.error('⚠️ Failed to send 429 response:', sendError.message)
+          if (!res.headersSent) {
+            return res.status(429).type('application/json').send(JSON.stringify(errorResponse))
+          }
+        }
       }
 
       // 处理其他错误状态码
@@ -263,14 +272,36 @@ class OpenAIResponsesRelayService {
           req.removeListener('close', handleClientDisconnect)
           res.removeListener('close', handleClientDisconnect)
 
-          return res.status(401).json(unauthorizedResponse)
+          // 安全地返回401错误
+          try {
+            return res.status(401).json(unauthorizedResponse)
+          } catch (sendError) {
+            logger.error('⚠️ Failed to send 401 response:', sendError.message)
+            if (!res.headersSent) {
+              return res
+                .status(401)
+                .type('application/json')
+                .send(JSON.stringify(unauthorizedResponse))
+            }
+          }
         }
 
         // 清理监听器
         req.removeListener('close', handleClientDisconnect)
         res.removeListener('close', handleClientDisconnect)
 
-        return res.status(response.status).json(errorData)
+        // 安全地返回错误响应
+        try {
+          return res.status(response.status).json(errorData)
+        } catch (sendError) {
+          logger.error('⚠️ Failed to send error response:', sendError.message)
+          if (!res.headersSent) {
+            return res
+              .status(response.status)
+              .type('application/json')
+              .send(JSON.stringify(errorData))
+          }
+        }
       }
 
       // 成功：清空错误计数并更新最后使用时间
@@ -415,20 +446,57 @@ class OpenAIResponsesRelayService {
             }
           }
 
-          return res.status(401).json(unauthorizedResponse)
+          // 安全地返回401错误
+          try {
+            return res.status(401).json(unauthorizedResponse)
+          } catch (sendError) {
+            logger.error('⚠️ Failed to send 401 response in catch:', sendError.message)
+            if (!res.headersSent) {
+              return res
+                .status(401)
+                .type('application/json')
+                .send(JSON.stringify(unauthorizedResponse))
+            }
+          }
         }
 
-        return res.status(status).json(errorData)
+        // 安全地返回错误响应
+        try {
+          return res.status(status).json(errorData)
+        } catch (sendError) {
+          logger.error('⚠️ Failed to send error response in catch:', sendError.message)
+          if (!res.headersSent) {
+            return res.status(status).type('application/json').send(JSON.stringify(errorData))
+          }
+        }
       }
 
-      // 其他错误
-      return res.status(500).json({
-        error: {
-          message: 'Internal server error',
-          type: 'internal_error',
-          details: error.message
+      // 其他错误 - 安全地返回500错误
+      try {
+        return res.status(500).json({
+          error: {
+            message: 'Internal server error',
+            type: 'internal_error',
+            details: error.message
+          }
+        })
+      } catch (sendError) {
+        logger.error('⚠️ Failed to send 500 response:', sendError.message)
+        if (!res.headersSent) {
+          return res
+            .status(500)
+            .type('application/json')
+            .send(
+              JSON.stringify({
+                error: {
+                  message: 'Internal server error',
+                  type: 'internal_error',
+                  details: error.message
+                }
+              })
+            )
         }
-      })
+      }
     }
   }
 
